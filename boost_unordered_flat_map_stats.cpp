@@ -1,7 +1,18 @@
 /* Statistical properties of boost::unordered_flat_map and
  * absl::flat_hash_map obtained via simulation.
+ * 
+ * Expanded to match the theoretical analysis in
+ * Cyril Nicaud and Pablo Rotondo, “Fine-Grained Analysis of SIMD-Based Hash
+ * Table Implementations.” arXiv preprint arXiv:2610.02385, 2026.
+ * https://arxiv.org/abs/2610.02385
+ * template<bool RandomProbing=false,bool RandomOverflowBit=false>
+ * struct boost_map;
+ *   - RandomProbing: probe groups at random (based on hash) instead of
+ *     quadratically.
+ *   - RandomOverflowBit: the associated overflow bit changes randomly
+ *     (based on hash) at each visited group.
  *
- * Copyright 2022 Joaquin M Lopez Munoz.
+ * Copyright 2022-2026 Joaquin M Lopez Munoz.
  * Distributed under the Boost Software License, Version 1.0.
  * (See accompanying file LICENSE_1_0.txt or copy at
  * http://www.boost.org/LICENSE_1_0.txt)
@@ -15,10 +26,11 @@
 #include <optional>
 #include <random>
 #include <vector>
+#include <type_traits>
 
 struct pow2_quadratic_prober
 {
-  pow2_quadratic_prober(std::size_t pos_):pos{pos_}{}
+  pow2_quadratic_prober(std::size_t pos_,std::size_t=0 /* hash */):pos{pos_}{}
 
   inline std::size_t get()const{return pos;}
 
@@ -33,6 +45,25 @@ private:
   std::size_t pos,step=0;
 };
 
+struct random_prober
+{
+  random_prober(std::size_t pos_,std::size_t hash):
+    pos{pos_},gen((std::uint_fast32_t)hash){}
+
+  inline std::size_t get()const{return pos;}
+
+  inline bool next(std::size_t mask)
+  {
+    step+=1;
+    pos=std::uniform_int_distribution<std::size_t>(0,mask)(gen);
+    return step<=mask;
+  }
+
+private:
+  std::size_t  pos,step=0;
+  std::mt19937 gen;
+};
+
 struct find_info
 {
   find_info& operator +=(const find_info& x)
@@ -45,16 +76,48 @@ struct find_info
   std::size_t num_hops=0,num_cmps=0;
 };
 
+struct default_overflow_mask_producer
+{
+  default_overflow_mask_producer(std::size_t hash):
+    res(static_cast<unsigned char>(1<<(hash%8))){}
+
+  unsigned char operator()()const{return res;}
+
+private:
+  unsigned char res;
+};
+
+struct random_overflow_mask_producer
+{
+  random_overflow_mask_producer(std::size_t hash):
+    gen((std::uint_fast32_t)hash){}
+
+  unsigned char operator()()
+  {
+    return 1<<std::uniform_int_distribution<int>(0,7)(gen);
+  }
+
+private:
+  std::mt19937 gen;
+};
+
+template<bool RandomProbing=false,bool RandomOverflowBit=false>
 struct boost_map
 {
   static constexpr int N=15;
+  using prober=std::conditional_t<
+    RandomProbing,random_prober,pow2_quadratic_prober>;
+  using overflow_mask_producer=std::conditional_t<
+    RandomOverflowBit,
+    random_overflow_mask_producer,default_overflow_mask_producer>;
 
   boost_map(std::size_t capacity):groups{capacity}{}
 
   bool insert(std::size_t hash)
   {
+    overflow_mask_producer omp(hash);
     if(find(hash).second)return false;
-    for(pow2_quadratic_prober pb(position_for(hash));;
+    for(prober pb(position_for(hash),hash);;
         pb.next(groups.size()-1)){
       auto& g=groups[pb.get()];
       if(g.n<N){
@@ -62,15 +125,16 @@ struct boost_map
         return true;
       }
       else{
-        g.overflow|=static_cast<unsigned char>(1<<(hash%8));
+        g.overflow|=omp();
       }
     }
   }
 
   std::pair<find_info,bool> find(std::size_t hash)const
   {
-    find_info info;
-    for(pow2_quadratic_prober pb(position_for(hash));;
+    find_info              info;
+    overflow_mask_producer omp(hash);
+    for(prober pb(position_for(hash),hash);;
         ++info.num_hops,pb.next(groups.size()-1)){
       auto& g=groups[pb.get()];
       auto first=g.elements.begin(),last=first+g.n;
@@ -83,7 +147,7 @@ struct boost_map
         ++info.num_cmps;
         return {info,true};
       }
-      if(!(g.overflow&static_cast<unsigned char>(1<<(hash%8)))){
+      if(!(g.overflow&omp())){
         return {info,false};
       }
     }
@@ -264,6 +328,11 @@ void stats(const char* label)
 
 int main()
 {
-  stats<boost_map>("boost::unordered_flat_map");
+  stats<boost_map<>>("boost::unordered_flat_map");
+  stats<boost_map<true>>("boost::unordered_flat_map, random probing");
+  stats<boost_map<false,true>>(
+    "boost::unordered_flat_map, random overflow bit");
+  stats<boost_map<true,true>>(
+    "boost::unordered_flat_map, random probing and overflow bit");
   stats<abseil_map>("absl::flat_hash_map");
 }
